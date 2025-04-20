@@ -1,6 +1,6 @@
 #ifndef _BYTEBUFFER_H_
 #define _BYTEBUFFER_H_
-#endif
+
 
 #include<cstdint>
 #include<vector>
@@ -14,7 +14,7 @@ constexpr uint32_t BB_DEFAULT_SIZE = 4096;  //constexpr是修饰一个常量表�
 
 #ifdef BB_USE_NS
 namespace bb{
-
+#endif
 
 class ByteBuffer{
 private:
