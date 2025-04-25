@@ -68,7 +68,7 @@ public:
     explicit ByteBuffer(const uint8_t* arr, uint32_t size);
     virtual ~ByteBuffer() = default;
     
-    uint32_t bytesReamining() const;  // 从当前读取位置到缓冲区结束的字节数
+    uint32_t bytesRemaining() const;  // 从当前读取位置到缓冲区结束的字节数
     void clear();  // 清除vector并重置读写位置
     std::unique_ptr<ByteBuffer> clone();  // 返回contents和state(rpos、wpos)完全相同的 ByteBuffer 新实例
     bool equals(const ByteBuffer* other) const;  // 比较contents是否相同
