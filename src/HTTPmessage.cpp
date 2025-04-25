@@ -109,4 +109,176 @@ std::string HTTPMessage::getStrElement(char delim){
     return ret;
 }
 
+//  parse headers
+//  当 HTTP 消息（请求和响应）到达出现头信息的位置时，应调用此方法. 应调用该方法来解析并填充头信息的内部映射
+//  解析头信息会将读取位置移到头信息结束时的空行之后。
+
+void HTTPMessage::parseHeaders(){
+    std::string hline = "";
+    std::string app = "";
+
+    //  获取第一个header
+    hline = getLine();
+
+    // 继续提取headers，直到出现空行（标头结束）为止
+    while (hline.size() > 0){
+        //  以逗号结尾的多行数值的情况
+        app = hline;
+        while (app[app.size() - 1] == ',')
+        {
+            app = getLine();
+            hline += app;
+        }
+        addHeader(hline);
+        hline = getLine();
+    }
+}
+
+//  parse body
+//  解析 HTTP 消息headers部分之后的所有内容。处理分块响应/请求
+//  成功时返回 True。错误时为 False，parseErrorStr 设置原因
+bool HTTPMessage::parseBody() {
+    //  如果有正文数据，则应存在 Content-Length（正文数据的大小）。
+    std::string hlenstr = "";
+    uint32_t contentLen = 0;
+    hlenstr = getHeaderValue("content-Length");
+    // no body data to read
+    if (hlenstr.empty())
+        return true;
+    
+    contentLen = atoi(hlenstr.c_str());  // 字符串转整型， c_str()返回指向 C 风格字符串（即以 null 结尾的字符数组）的常量指针。
+    
+    // contentLen 不应超过缓冲区的剩余字节数
+    // 在 bytesRemaining 中加 1，以便包含当前读取位置的字节
+    if (contentLen > bytesRemaining() + 1){
+         // 如果超过，则存在潜在的安全问题，我们无法可靠地解析
+        //  dataLen = bytesRemaining();
+        parseErrorStr = "content-length(" + hlenstr +") is greater than remaining bytes(" + std::to_string(bytesRemaining()) +")";
+        return false;
+    }
+    else if(contentLen == 0){
+        //  没有可以读取的
+        return true;
+    }
+    else {
+        // 否则，我们可以相信 Content-Length 是有效的，并读取指定的字节数
+        dataLen = contentLen;
+    }
+
+    // 创建足够大的buffer存储data
+    uint32_t dIdx = 0;
+    uint32_t s = size();
+    if(s > dataLen){
+        parseErrorStr = "ByteBuffer size of " + std::to_string(s) + " is greater than dataLen " + std::to_string(dataLen);
+        return false;
+    }
+
+    data = new uint8_t[dataLen];
+    // 抓取从当前位置到末尾的所有字节
+    for(uint32_t i = getReadPos(); i<s;++i){
+        data[dIdx] = get(i);
+        dIdx++;
+    }
+
+    // 可以在这里处理分块的请求/响应解析（带页脚），但此项目不这样做。
+    return true;
+}
+
+// 从字符串向映射添加header
+// 获取格式化的标题字符串 "Header: value"，对其进行解析，并将其作为键值对放入 std::map 中。
+// param string包含格式化的header：value
+void HTTPMessage::addHeader(std::string const& line){
+    size_t kpos = line.find(':');
+    if (kpos == std::string::npos) {
+        std::cout<< "Could not addHeader:" << line << std::endl;
+        return;
+    }
+    // 拒绝长度超过 32 个字符的 HTTP 标头密钥
+    if (kpos > 32)
+        return;
+    std::string key = line.substr(0, kpos);
+    if (key.empty())
+        return;
+    int32_t value_len = line.size() - kpos - 1;
+    if(value_len <= 0)
+        return;
+
+    // 拒绝超过 4kb 的 HTTP header
+    if (value_len > 4096)
+        return;
+    
+    std::string value = line.substr(kpos + 1, value_len);
+
+    // 跳过数值中所有前导空格
+    int32_t i = 0;
+    while (i < value.size() && value.at(i) == 0x20)  // at() 安全地访问字符串 中指定位置的字符， 索引超出范围则抛出异常
+        ++i;
+    
+    value = value.substr(i, value.size());
+    if (value.empty())
+        return;
+    
+    // 将header添加进map
+    addHeader(key,value);
+}
+
+// 向map添加header 键值对
+void HTTPMessage::addHeader(std::string const& key, std::string const& value){
+    headers.try_emplace(key, value);   // 键不存在 的情况下才“原地”构造并插入元素；若键已存在，则什么都不做。
+}
+
+// 向map中添加header键值对
+// 整型转为字符串
+void HTTPMessage::addHeader(std::string const& key, int32_t value){
+    headers.try_emplace(key, std::to_string(value));
+}
+
+// 获取header value
+// 给定header key，返回header map中对应的value
+std::string HTTPMessage::getHeaderValue(std::string const& key) const{
+    char c = 0;
+    std::string key_lower = "";
+
+    auto it = headers.find(key);
+    // 键未找到，则尝试全小写的变体，因为有些客户端并不总是使用正确的大写字母
+    if (it == headers.end()){
+        for(uint32_t i = 0; i<key.length(); ++i){
+            c = key.at(i);
+            key_lower += tolower(c);
+        }
+        // 如果仍未找到，则返回空字符串，表示头值不存在
+        it = headers.find(key_lower);
+        if (it == headers.end())
+            return "";
+    }
+
+    return it->second;
+}
+
+// get header string
+// 从索引位置的header map 中获取格式完整的header:value string
+std::string HTTPMessage::getHeaderStr(int32_t index) const{
+    int32_t i = 0;
+    std::string ret = "";
+    for (auto const &[key, value] : headers){
+        if (i == index){
+            ret = key+": "+ value;
+            break;
+        }
+        ++i;
+    }
+    return ret;
+}
+
+// get number of headers
+uint32_t HTTPMessage::getNumHeaders() const {
+    return headers.size();
+}
+
+//clear headers
+void HTTPMessage::clearHeaders() {
+    headers.clear();
+}
+
+
 
