@@ -100,9 +100,9 @@ std::string HTTPMessage::getStrElement(char delim){
 
     // 从缓冲区获取string直到分隔符
     auto str = std::make_unique<char[]>(size);
-    getBytes((uint8_t*)str.get(), size);       // 从缓冲区取size长度内容放入str中
-    str[size - 1] = 0x00;
-    std::string ret = str.get();
+    getBytes((uint8_t*)str.get(), size);       // 从缓冲区取size长度内容放入str中， unique_ptr的get方法返回一个该字符数组的原始指针这里是char*
+    str[size - 1] = 0x00;                      // 字符数组的最后一个字节设置为 0x00，也就是 null 终止符。这样，字符串在内存中就变成了一个 C 风格的字符串（以 null 结尾），这是 std::string 所需要的格式。
+    std::string ret = str.get();               // 返回的是一个指向字符数组的原始指针，它被传递给 std::string 构造函数。由于字符数组以 null 结尾，std::string 会自动从这个原始指针构造一个字符串对象，并存储在 ret 中。
     // 在分隔符之后增加读取位置
     setReadPos(endPos + 1);
 
@@ -141,7 +141,7 @@ bool HTTPMessage::parseBody() {
     //  如果有正文数据，则应存在 Content-Length（正文数据的大小）。
     std::string hlenstr = "";
     uint32_t contentLen = 0;
-    hlenstr = getHeaderValue("content-Length");
+    hlenstr = getHeaderValue("content-Length");   // 返回header map中对应的value
     // no body data to read
     if (hlenstr.empty())
         return true;
