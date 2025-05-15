@@ -205,3 +205,169 @@ void HTTPServer::process(){
         }
     }
 }
+
+//  接受连接
+//  当 runServer() 检测到新连接时，该函数将被调用。它会尝试接受待处理的连接，实例化一个客户端对象，并添加到客户端映射中。
+void HTTPServer::acceptConnection(){
+    // 使用预设地址信息设置新客户
+    sockaddr_in clientAddr;
+    int32_t clientAddrLen = sizeof(clientAddr);
+    int32_t clfd = INVALID_SOCKET;
+
+    // 接受待处理连接并重新获取客户描述符
+    clfd = accept(listenSocket, (sockaddr*)&clientAddr,(socklen_t*)&clientAddrLen);
+    if(clfd ==INVALID_SOCKET)
+        return;
+
+    // 将socket设置为非阻塞
+    fcntl(clfd, F_SETFL, O_NONBLOCK);
+
+    // 添加 kqueue 事件，以跟踪新客户端套接字的 “读取 ”和 “写入 ”事件
+    updateEvent(clfd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    updateEvent(clfd, EVFILT_WRITE, EV_ADD | EV_DISABLE, 0, 0, NULL);
+
+    // 创建一个客户端对象到client map
+    auto cl = std::make_unique<Client>(clfd, clientAddr);
+    std::cout << "[" << cl->getClientIP() << "] connected" << std::endl;
+    clientMap.try_emplace(clfd, std::move(cl));
+}
+
+// get client
+// 根据clientMap中的套接字描述符编号查找客户
+// 参数 clfd 客户端套接字描述符
+// 如果找到，返回客户端对象指针。否则为空
+std::shared_ptr<Client> HTTPServer::getClient(int clfd){
+    auto it = clientMap.find(clfd);
+    if (it == clientMap.end()){
+        return nullptr;
+    }
+    return it->second;
+}
+
+// 断开客户端连接
+// 关闭客户端的套接字描述符，并将其从 FD 映射、客户端映射和内存中释放出来
+//  @param cl 客户端对象指针
+//  当 mapErase 为 true 时，从客户端映射中删除客户端。
+//  如果正在对客户端映射进行操作，而我们又不想立即删除映射条目，则需要使用该参数
+void HTTPServer::disconnectClient(std::shared_ptr<Client> cl, bool mapErase){
+    if (cl == nullptr){
+        return;
+    }
+    std::cout << "[" << cl->getClientIP() << "] disconnected" << std::endl;
+    // cong kqueue 中删除套接字事件
+    updateEvent(cl->getSocket(), EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    updateEvent(cl->getSocket(), EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+
+    // 关闭套接字描述符
+    close(cl->getSocket());
+
+    // 从 clientMap 中删除客户端
+    if (mapErase)
+        clientMap.erase(cl->getSocket());
+}
+
+// 读取客户端请求
+// 从表示有数据等待的客户端接收数据。将接收到的数据传递给 handleRequest()
+// 同时检测套接字状态中的任何错误
+// @param cl 发送数据的客户端指针
+// @param data_len 等待读取的字节数
+void HTTPServer::readClient(std::shared_ptr<Client> cl, int32_t data_len){
+    if (cl == nullptr){
+        return;
+    }
+    // 如果读取过滤器触发时数据为 0 字节，客户端可能需要断开连接
+    // 默认将 data_len 设置为以太网最大 MTU
+    if (data_len == 0){
+        data_len = 1400;
+    }
+
+    auto pData = std::make_unique<uint8_t[]>(data_len);
+
+    int32_t flags = 0;
+    ssize_t lenRecv = recv(cl->getSocket(), pData.get(), data_len, flags);
+    // 确定客户端套接字的状态并采取行动
+    if (lenRecv == 0){
+        // client 断开连接
+        std::cout << "[" << cl->getClientIP() << "] has opted to close the connection" << std::endl;
+        disconnectClient(cl, true);
+    }
+    else if (lenRecv < 0){
+        disconnectClient(cl, true);
+    } else {
+        // 把data放入HTTPRequest并发送给handleRequest()处理
+        auto req = new HTTPRequest(pData.get(), lenRecv);
+        handleRequest(cl, req);
+        delete req;
+    }
+}
+
+// 写入client
+// 客户端表示已读写。如果发送队列中有一个项目，则向套接字写入 avail_bytes 字节数
+// @param cl 发送数据的客户端指针
+// @param avail_bytes 发送缓冲区中可供写入的字节数
+bool HTTPServer::writeClient(std::shared_ptr<Client> cl, int32_t avail_bytes){
+    if(cl == nullptr){
+        return false;
+    }
+    
+    int32_t actual_sent = 0;  // 实际发送的字节数
+    int32_t attempt_sent = 0;  // 尝试发送的字节数
+
+    if (avail_bytes >1400){
+        // 限制最大发送字节数
+        avail_bytes = 1400;
+    }
+    else if (avail_bytes == 0){
+        // 有时操作系统在可以发送数据时报告为 0 - 尝试涓流数据
+        // 操作系统最终会增加可用字节数
+        avail_bytes = 64;
+    }
+
+    auto item = cl->nextInSendQueue();
+    if (item == nullptr)
+        return false;
+    
+    const uint8_t* const pData = item->getRawDataPointer();
+    // 项目尚未发送的数据量
+    int32_t remaining = item->getSize() - item->getOffset();
+    bool disconnect = item->getDisconnect();
+
+    if (avail_bytes >= remaining) {
+        // 发送缓冲区大于我们的需要，其余项目可以发送
+        attempt_sent = remaining;
+    } else {
+        // 发送缓冲区小于我们的需要，发送可用的数量
+        attempt_sent = avail_bytes;
+    }
+
+    // 发送数据并按实际发送量递增偏移量
+    actual_sent = send(cl->getSocket(), pData + (item->getOffset()), attempt_sent, 0);
+    if (actual_sent >= 0)
+        item->setOffset(item->getOffset() + actual_sent);
+    else
+        disconnect = true;
+
+    // std::cout << "[" << cl->getClientIP() << "] was sent " << actual_sent << " bytes " << std::endl;
+
+    // 不再需要 SendQueueItem。去队列和删除
+    if (item->getOffset() >= item->getSize())
+        cl->dequeueFromSendQueue();
+
+    if (disconnect) {
+        disconnectClient(cl, true);
+        return false;
+    }
+
+    return true;
+
+    
+
+}
+
+
+
+
+
+
+
+
