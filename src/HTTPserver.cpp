@@ -359,15 +359,118 @@ bool HTTPServer::writeClient(std::shared_ptr<Client> cl, int32_t avail_bytes){
     }
 
     return true;
-
-    
-
 }
 
+// 处理来自客户端的请求。将请求发送到相应的处理函数
+//  对应 HTTP 操作（GET、HEAD 等)
+//  @param cl 客户端对象，请求来自该对象
+//  @param req HTTPRequest 对象，包含原始数据包数据
 
+void HTTPServer::handleRequest(std::shared_ptr<Client> cl, HTTPRequest* const req){
+    // 解析 request
+    // 如果有错误，发送错误响应
+    if (!req->parse()){
+        std::cout << "[" << cl->getClientIP() << "] There was an error processing the request of type: " << req->methodIntToStr(req->getMethod()) << std::endl;
+        std::cout << req->getParseError() << std::endl;
+        sendErrorResponse(cl, Status(BAD_REQUEST));
+        return;
+    }
+    std::cout << "[" << cl->getClientIP() << "] " << req->methodIntToStr(req->getMethod()) << " " << req->getRequestUri() << std::endl;
 
+    // 发送request 到correct handler
+    switch (req->getMethod()){
+        case Method(HEAD):
+        case Method(GET):
+            handleGet(cl, req);
+            break;
+        case Method(OPTIONS):
+            handleOptions(cl, req);
+            break;
+        case Method(TRACE):
+            handleTrace(cl, req);
+            break;
+        default:
+            std::cout << "[" << cl->getClientIP() << "] Could not handle or determine request of type " << req->methodIntToStr(req->getMethod()) << std::endl;
+            sendStatusResponse(cl, Status(NOT_IMPLEMENTED));
+            break;
+    }
+}
 
+//  处理 GET 或 HEAD 请求，为客户端提供适当的响应
+//  @param cl 客户端对象，请求来自该对象
+//  @param req HTTPRequest 对象，包含原始数据包数据
+void HTTPServer::handleGet(std::shared_ptr<Client> cl, HTTPRequest* const req){
+    auto resHost = this->getResourceHostForRequest(req);
 
+    // 无法确定资源主机或客户端指定的主机无效
+    if (resHost == nullptr){
+        sendStatusResponse(cl, Status(BAD_REQUEST), "Invalid/No Host specified");
+        return
+    }
+    // 检查被请求资源是否存在
+    auto uri = req->getRequestUri();
+    auto r = resHost->getResource(uri);
+    if (r!= nullptr){
+        std::cout << "[" << cl->getClientIP() << "] " << "Sending file: " << uri << std::endl;
 
+        auto resp = std::make_unique<HTTPResponse>();
+        resp->setStatus(Status(OK));
+        resp->addHeader("Content-Type", r->getMimeType());
+        resp->addHeader("Content-Length", r->getSize());
 
+        // 只有在 GET 请求时才发送信息正文
+        if (req->getMethod() == Method(GET))
+            resp->setData(r->getData(), r->getSize());
+        
+        bool dc = false;
+        // HTTP/1.0 默认关闭连接
+        if (req->getVersion().compare(HTTP_VERSION_10) == 0)
+            dc = true;
+        
+        // 如果指定了连接：关闭，则应在请求处理完毕后终止连接
+        if (auto con_val = req->getHeader("Connection"); con_val.compare("close")==0)
+            dc = true;
 
+        sendResponse(cl, std::move(resp), dc);
+
+    }else{
+        // 资源不存在
+        std::cout << "[" << cl->getClientIP() << "] " << "File not found: " << uri << std::endl;
+        sendStatusResponse(cl, Status(NOT_FOUND));
+    }
+}
+// 处理 OPTIONS 请求
+// OPTIONS 返回服务器 (*) 或特定资源允许的能力
+// @param cl 请求资源的客户端
+// @param req 请求状态
+void HTTPServer::handleOptions(std::shared_ptr<Client> cl, [[maybe_unused]] const HTTPRequest* const req) {
+    // 返回服务器的能力，而不是为每个资源计算能力
+    std::string allow = "HEAD, GET, OPTIONS, TRACE";
+
+    auto resp = std::make_unique<HTTPResponse>();
+    resp->setStatus(Status(OK));
+    resp->addHeader("Allow", allow);
+    resp->addHeader("Content-Length", "0"); // Required
+
+    sendResponse(cl, std::move(resp), true);
+}
+
+// 处理 TRACE 请求
+// TRACE: 逐字发回服务器收到的请求
+// @param cl 请求资源的客户端
+// @param req 请求状态
+void HTTPServer::handleTrace(std::shared_ptr<Client> cl, HTTPRequest* const req) {
+    // 获取请求的字节数组表示
+    uint32_t len = req->size();
+    auto buf = std::make_unique<uint8_t[]>(len);
+    req->setReadPos(0); //将读取位置设置在起始位置，因为请求已被读取到终点
+    req->getBytes(buf.get(), len);
+
+    // 发送以整个请求为正文的响应
+    auto resp = std::make_unique<HTTPResponse>();
+    resp->setStatus(Status(OK));
+    resp->addHeader("Content-Type", "message/http");
+    resp->addHeader("Content-Length", len);
+    resp->setData(buf.get(), len);
+    sendResponse(cl, std::move(resp), true);
+}
