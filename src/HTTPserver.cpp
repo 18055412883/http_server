@@ -474,3 +474,84 @@ void HTTPServer::handleTrace(std::shared_ptr<Client> cl, HTTPRequest* const req)
     resp->setData(buf.get(), len);
     sendResponse(cl, std::move(resp), true);
 }
+
+// 发送状态响应
+//  向客户端发送预定义的 HTTP 状态代码响应，其中只包含状态代码和所需的标头，然后断开客户端连接
+//  @param cl 要向其发送状态代码的客户端 与 HTTPMessage.h 中的枚举相对应的状态代码
+//  @param msg 附加到正文的额外信息
+void HTTPServer::sendStatusResponse(std::shared_ptr<client> cl, int32_t status, const std::string const& msg){
+    auto resp = std::make_unique<HTTPResponse>();
+    resp->setStatus(status);
+
+    // body: reason string + additional msg
+    std::string body = resp->getReason();
+    if (msg.length() > 0 )
+        body += ": " + msg;
+    
+    uint32_t slen = body.length();
+    auto sdata = new uint8_t[slen];
+    memset(sdata, 0x00, slen);
+    strncpy((char*)sdata, body.c_str(), slen);
+
+    resp->addHeader("Content-Type", "text/plain");
+    resp->addHeader("Content-Length", slen);
+    resp->setData(sdata, slen);
+
+    sendResponse(cl, std::move(resp), true);
+}
+
+// 发送 response
+// 向特定客户端发送通用 HTTPResponse 数据包
+//  * @param Cl 待发送的客户端
+//  * @param buf 含有待发送数据的字节缓冲区
+//  * @param disconnect 服务器是否应在发送后断开与客户端的连接（可选，默认 = false）
+void HTTPServer::sendResponse(std::shared_ptr<Client> cl, std::unique_ptr<HTTPResponse> resp, bool disconnect){
+    resp->addHeader("Server", "httpserver/1.0");
+
+    // 使用日期标头对响应进行时间标记
+    std::string tstr;
+    char tbuf[36] = {0};
+    time_t rawtime;
+    struct tm ptm = {0};
+    time(&rawtime);
+    if (gmtime_r(&rawtime, &ptm) != nullptr){
+        strftime(tbuf, 36, "%a, %d %b %Y %H:%M:%S GMT", &ptm);
+        tstr = tbuf;
+        resp->addHeader("Date", tstr);
+    }
+    // 如果这是服务器发送的最终响应，则包含 Connection: close 头信息
+    if (disconnect){
+        resp->addHeader("Connection", "close");
+    }
+
+    // 通过创建响应获取原始数据（我们负责在 process() 中对其进行清理）
+    // 将数据添加到客户端的发送队列中
+    cl->addToSendQueue(new SendQueueItem(resp->create(), resp->size(), disconnect));
+}
+
+// 获取资源主机
+//  根据请求的路径 检索 适当的 ResourceHost 实例 
+//  @param req 请求状态
+std::shared_ptr<ResourceHost> HTTPServer::getResourceHostForRequest(const HTTPRequest* const req){
+    // 确定合适的虚拟主机
+    std::string host = "";
+    //  读取请求中指定的主机（符合 HTTP/1.1 要求）
+    if (req->getVersion().compare(HTTP_VERSION_11) == 0){
+        host = req->getHeaderValue("Host");
+        // 所有虚拟主机都附加了端口，因此如果不存在端口，则需要将其附加到主机上
+        if (!host.contains(":")){
+            host.append(":" + listenPort);
+        }
+        auto it = vhosts.find(host);
+
+        if (it != vhosts.end()){
+            return it->second;
+        }
+    } else {
+        // Temporary： HTTP/1.0 会给出 hostList 中的第一个资源主机
+        // TODO: 允许管理员指定 "默认资源主机
+        if (!hostList.empty())
+            return hostList[0];
+    }
+    return nullptr;
+}
